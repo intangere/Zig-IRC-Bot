@@ -1,7 +1,6 @@
 const print = @import("std").debug.print;
 const std = @import("std");
 const net = std.net;
-const testing = std.testing;
 
 const host = "irc.freenode.net";
 const port = 6667;
@@ -10,63 +9,76 @@ const delimiter = "\r\n";
 const channel = "#some-random-channel-001";
 
 const irc = struct {
-    var conn: net.Stream = undefined;
+    const This = @This();
+    conn: net.Stream = undefined,
+    allocator: std.mem.Allocator,
+    buf: std.ArrayList(u8) = undefined,
 
-    fn init() anyerror!void {
-        conn = try net.tcpConnectToHost(testing.allocator, host, port);
-        _ = try conn.write(buildNickPacket());
-        _ = try conn.write(buildUserPacket());
+    fn init(allocator: std.mem.Allocator) !*This {
+        var this = try allocator.create(This);
+        var conn = try net.tcpConnectToHost(allocator, host, port);
+        var buf = std.ArrayList(u8).init(allocator);
+
+        this.* = .{ .allocator = allocator, .conn = conn, .buf = buf };
+        return this;
     }
 
-    fn buildNickPacket() []const u8 {
-        return "NICK " ++ nickname ++ delimiter;
+    fn sendNickPacket(this: *This) anyerror!void {
+        _ = try this.send("NICK " ++ nickname ++ delimiter);
     }
 
-    fn buildUserPacket() []const u8 {
-        return "USER " ++ nickname ++ " * * :" ++ nickname ++ delimiter;
+    fn sendUserPacket(this: *This) anyerror!void {
+        _ = try this.send("USER " ++ nickname ++ " * * :" ++ nickname ++ delimiter);
     }
 
-    fn buildPongPacket(id: []u8) anyerror![]const u8 {
-        return try std.fmt.allocPrint(std.heap.page_allocator, "PONG :{s}{s}", .{ id, delimiter });
+    fn sendPongPacket(this: *This, id: []u8) anyerror!void {
+        const pong = try std.fmt.allocPrint(this.allocator, "PONG :{s}{s}", .{ id, delimiter });
+        _ = try this.send(pong);
     }
 
-    fn buildJoinPacket() anyerror![]const u8 {
-        return try std.fmt.allocPrint(std.heap.page_allocator, "JOIN {s}{s}", .{ channel, delimiter });
+    fn sendJoinPacket(this: *This) anyerror!void {
+        const join = try std.fmt.allocPrint(this.allocator, "JOIN {s}{s}", .{ channel, delimiter });
+        _ = try this.send(join);
     }
 
-    fn readLine() anyerror![]u8 {
-        var buf = std.ArrayList(u8).init(std.heap.page_allocator);
+    fn readLine(this: *This) anyerror![]u8 {
         var chr: [1]u8 = undefined;
+        this.buf.clearRetainingCapacity();
+
         while (chr[0] != '\n') {
-            var len = try conn.read(&chr);
+            var len = try this.conn.read(&chr);
             if (len == 0) {
                 break;
             }
-            _ = try buf.append(chr[0]);
+            _ = try this.buf.append(chr[0]);
         }
-        return buf.toOwnedSlice();
+        return this.buf.toOwnedSlice();
     }
 
-    fn loop() anyerror!void {
-        _ = try init();
+    fn loop(this: *This) anyerror!void {
+        defer this.conn.close();
+
+        _ = try this.sendNickPacket();
+        _ = try this.sendUserPacket();
+
         while (true) {
-            const buf = try readLine();
+            const buf = try this.readLine();
+            defer this.allocator.free(buf);
             if (buf.len == 0) {
                 print("[BYE]: Connection Closed", .{});
                 return;
             }
             print("[INFO]: {s}", .{buf});
-            _ = try handleMessage(buf[0..buf.len]);
-            std.heap.page_allocator.free(buf);
+            _ = try this.handleMessage(buf[0..buf.len]);
         }
     }
 
-    fn send(msg: []const u8) anyerror!void {
+    fn send(this: *This, msg: []const u8) anyerror!void {
         print("[SEND]: {s}", .{msg});
-        _ = try conn.write(msg);
+        _ = try this.conn.write(msg);
     }
 
-    fn handleMessage(msg: []u8) anyerror!void {
+    fn handleMessage(this: *This, msg: []u8) anyerror!void {
         if (msg.len < 4) {
             return;
         }
@@ -74,19 +86,23 @@ const irc = struct {
         if (std.mem.eql(u8, msg[0..4], "PING")) {
             const idx = std.mem.indexOf(u8, msg, ":").?;
             const id = msg[idx + 1 ..];
-            const pong = try buildPongPacket(id);
-            _ = try send(pong);
+            _ = try this.sendPongPacket(id);
         }
 
         if (std.mem.indexOf(u8, msg, " 396 ")) |_| {
             print("Auto joining {s}\n", .{channel});
-            const join = try buildJoinPacket();
-            _ = try send(join);
+            _ = try this.sendJoinPacket();
         }
+    }
+
+    fn deinit(this: *This) void {
+        defer this.allocator.destroy(this);
     }
 };
 
 pub fn main() anyerror!void {
-    _ = try irc.init();
-    _ = try irc.loop();
+    var conn = try irc.init(std.heap.page_allocator);
+    defer conn.deinit();
+
+    _ = try conn.loop();
 }
